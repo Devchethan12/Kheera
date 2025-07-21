@@ -3,6 +3,7 @@ import {
   Injectable,
   InternalServerErrorException,
   UnauthorizedException,
+  OnModuleInit,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { AuthEntity } from './entities/auth.entity';
@@ -10,14 +11,25 @@ import { Repository } from 'typeorm';
 import { JwtService } from '@nestjs/jwt';
 import { AuthDto } from './dto/auth.dto';
 import { compare, hash } from 'bcrypt';
+import { BloomFilter } from 'bloom-filters';
 import { AuthDTO } from './dto/auth.dto';
+
 @Injectable()
-export class AuthService {
+export class AuthService implements OnModuleInit {
+  private emailFilter: BloomFilter;
+
   constructor(
     @InjectRepository(AuthEntity)
     private authRepo: Repository<AuthEntity>,
     private readonly jwtService: JwtService,
-  ) {}
+  ) {
+    this.emailFilter = new BloomFilter(1000, 1);
+  }
+
+  async onModuleInit() {
+    const users = await this.authRepo.find({ select: ['email'] });
+    users.forEach((user) => this.emailFilter.add(user.email));
+  }
 
   async signup(authService: AuthDto) {
     try {
@@ -25,14 +37,20 @@ export class AuthService {
 
       if (error) {
         const messages = error.details.map((d) => d.message.replace(/"/g, ''));
-
         throw new ConflictException(messages.join(', '));
       }
+
       const { email, password, username } = authService;
-      const userExist = await this.authRepo.findOne({ where: { email } });
-      if (userExist) {
-        throw new ConflictException('User already exist with the given email!');
+
+      if (this.emailFilter.has(email)) {
+        const existingUser = await this.authRepo.findOne({ where: { email } });
+        if (existingUser) {
+          throw new ConflictException(
+            'User already exists with the given email!',
+          );
+        }
       }
+
       const hashedPassword = await hash(password, 10);
       const user = this.authRepo.create({
         email,
@@ -40,8 +58,8 @@ export class AuthService {
         username,
       });
 
-      // Save user
       await this.authRepo.save(user);
+      this.emailFilter.add(email);
       return {
         message: 'User created successfully!',
       };
@@ -63,10 +81,12 @@ export class AuthService {
 
   async login(authService: AuthDto) {
     const { email, password } = authService;
+
     const user = await this.authRepo.findOne({ where: { email } });
     if (!user) {
       throw new UnauthorizedException('Invalid email or password');
     }
+
     const isPasswordValid = await compare(password, user.password);
     if (!isPasswordValid) {
       throw new UnauthorizedException('Invalid email or password');
